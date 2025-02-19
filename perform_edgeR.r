@@ -92,6 +92,7 @@ for (i in 1:nrow(comparisons_df)) {
 
 perform_edgeR_generalized <- function(countdata, group, comparisons) {
   # 1. Create DGEList object
+  group <- factor(group)
   y <- DGEList(counts=countdata, group=group)
 
   # 2. Filtering (remove low expression genes)
