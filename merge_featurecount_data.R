@@ -1,4 +1,4 @@
-merge_featurecount_data <- function(input_dir, pattern, output_file) {
+merge_featurecount_data <- function(input_dir, pattern) {
   # ディレクトリ内のファイルリストを取得
   file_list <- list.files(input_dir, pattern = pattern, full.names = TRUE)
   
@@ -34,9 +34,11 @@ merge_featurecount_data <- function(input_dir, pattern, output_file) {
       merged_df <- merge(merged_df, count_data, by = "Geneid", all = TRUE)
     }
   }
+
+  return(merged_df)
   
-  # 結果をファイルに出力
-  write.table(merged_df, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  # # 結果をファイルに出力
+  # write.table(merged_df, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
   
-  cat("結合されたデータフレームを", output_file, "に出力しました。\n")
+  # cat("結合されたデータフレームを", output_file, "に出力しました。\n")
 }
