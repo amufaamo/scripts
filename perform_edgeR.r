@@ -1,150 +1,141 @@
-#!/usr/bin/env Rscript
+# --- 3. edgeR解析を実行する関数 (1比較ペア版、QC/Norm/Dispのサンプル選択オプション付き) ---
 
-# Function to perform generalized edgeR analysis for differential gene expression.
-# This function takes count data, group information, and a list of comparisons as input,
-# and performs edgeR analysis to identify differentially expressed genes for each comparison.
-#
-# Usage:
-# 1. Prepare your count data as a CSV file (e.g., counts.csv) where rows are genes and columns are samples.
-#    The first column should be gene names and the first row should be sample names.
-#    Example:
-#       gene,sample1,sample2,sample3,sample4,sample5,sample6
-#       gene1,100,120,50,60,200,220
-#       gene2,50,60,20,30,100,110
-#       ...
-#
-# 2. Prepare your group information as a CSV file (e.g., group.csv) with one column indicating the group for each sample.
-#    The order of groups in this file must correspond to the column order in your count data.
-#    Example:
-#       control
-#       control
-#       treat1
-#       treat1
-#       treat2
-#       treat2
-#
-# 3. Prepare a comparisons list as a CSV file (e.g., comparisons.csv) with two columns: 'target' and 'reference' groups for each comparison.
-#    Each row defines a comparison you want to perform (target vs reference).
-#    Example:
-#       treat1,control
-#       treat2,control
-#       treat2,treat1
-#
-# 4. Run this script from the command line using Docker (or Rscript directly if you have dependencies installed):
-#    docker run -v $(pwd):/data your-dockerhub-username/edger-generalized \
-#        Rscript script.R \
-#        -c /data/counts.csv \
-#        -g /data/group.csv \
-#        -v /data/comparisons.csv \
-#        -o /data/output
-#
-#    Replace 'your-dockerhub-username/edger-generalized' with your Docker Hub image name.
-#    Make sure 'counts.csv', 'group.csv', and 'comparisons.csv' are in the same directory where you run the command.
-#    Results will be saved in the 'output' directory within the same directory.
-#
-# Arguments:
-#   countdata: Count data frame (rows: gene names, columns: sample names).
-#   group:     Factor vector of sample groups (corresponding to the column order of countdata).
-#   comparisons: A list of comparisons. Each element is a vector of two group names to compare (e.g., list(c("groupA", "groupB"), c("groupA", "groupC"))).
+perform_edgeR_one_comparison <- function(
+    countdata,
+    group,
+    comparison_pair,
+    output_dir = NULL,
+    use_all_samples_for_qc_norm_disp = TRUE # ★新しい引数 (デフォルトはTRUE)
+    ) {
 
-library(edgeR)
-library(optparse) # For command line argument parsing
+  # --- 入力データの検証 ---
+  # ... (前回の検証コードはそのまま) ...
+   if (!is.data.frame(countdata) && !is.matrix(countdata)) { stop("エラー: countdata は data.frame または matrix である必要があります。") }
+   if (!is.vector(group) && !is.factor(group)) { stop("エラー: group は vector または factor である必要があります。") }
+   if (!is.character(comparison_pair) || length(comparison_pair) != 2) { stop("エラー: comparison_pair は c('target', 'reference') 形式の長さ2の文字ベクトルである必要があります。") }
+   if (ncol(countdata) != length(group)) { stop("エラー: カウントデータの列数とグループ情報のサンプル数が一致しません。") }
 
-# Define command line arguments
-option_list <- list(
-  make_option(c("-c", "--countdata"), type="character", default=NULL,
-              help="Count data file (CSV format)", metavar="character"),
-  make_option(c("-g", "--groupfile"), type="character", default=NULL,
-              help="Group information file (CSV format, one column factor)", metavar="character"),
-  make_option(c("-v", "--comparisonsfile"), type="character", default=NULL,
-              help="Comparisons list file (CSV format, two columns: target, reference)", metavar="character"),
-  make_option(c("-o", "--outputdir"), type="character", default="output",
-              help="Output directory", metavar="character")
-)
+  original_group_factor <- factor(group) # 元のグループ情報 (因子)
+  target_group <- comparison_pair[1]
+  reference_group <- comparison_pair[2]
 
-opt_parser <- parse_args(OptionParser(option_list=option_list))
-
-if (is.null(opt_parser$countdata) || is.null(opt_parser$groupfile) || is.null(opt_parser$comparisonsfile)){
-  print_help(opt_parser)
-  stop("Count data, group file, and comparisons file must be provided.", call.=FALSE)
-}
-
-# Get filenames from arguments
-countdata_file <- opt_parser$countdata
-groupfile <- opt_parser$groupfile
-comparisonsfile <- opt_parser$comparisonsfile
-output_dir <- opt_parser$outputdir
-
-# Create output directory if it doesn't exist
-if (!dir.exists(output_dir)) {
-  dir.create(output_dir)
-}
-
-# Load data and configuration files
-countdata <- read.csv(countdata_file, row.names=1)
-group <- factor(read.csv(groupfile, header=FALSE)[,1])
-comparisons_df <- read.csv(comparisonsfile, header=FALSE)
-comparisons_list <- list()
-for (i in 1:nrow(comparisons_df)) {
-  comparisons_list[[i]] <- c(as.character(comparisons_df[i,1]), as.character(comparisons_df[i,2]))
-}
+  if (!target_group %in% levels(original_group_factor) || !reference_group %in% levels(original_group_factor)) { stop(paste("エラー: comparison_pair", paste(comparison_pair, collapse=" vs "), "に含まれるグループが group 情報に存在しません。")) }
+  if (target_group == reference_group) { stop("エラー: 比較ペアの target と reference が同じグループです。") }
+  comparison_name <- paste0(target_group, "_vs_", reference_group)
+  cat("入力データの検証OK\n")
+  cat("比較対象:", comparison_name, "\n")
 
 
-perform_edgeR_generalized <- function(countdata, group, comparisons) {
-  # 1. Create DGEList object
-  group <- factor(group)
-  y <- DGEList(counts=countdata, group=group)
+  # --- ★使用するサンプルを決定 ---
+  if (use_all_samples_for_qc_norm_disp) {
+      cat("初期ステップ (QC, Norm, Disp) で「全サンプル」を使用します。\n")
+      analysis_countdata <- countdata
+      analysis_group <- original_group_factor
+  } else {
+      cat("初期ステップ (QC, Norm, Disp) で「比較ペアのサンプルのみ」を使用します。\n")
+      samples_to_keep_logical <- original_group_factor %in% comparison_pair
+      if (sum(samples_to_keep_logical) < 2) { # 最低2サンプル必要
+          stop("エラー: 比較ペアに属するサンプル数が2未満のため、ペアのみでの解析は実行できません。")
+      }
+      analysis_countdata <- countdata[, samples_to_keep_logical, drop = FALSE]
+      # 使用しないレベルを削除
+      analysis_group <- droplevels(original_group_factor[samples_to_keep_logical])
 
-  # 2. Filtering (remove low expression genes)
-  keep <- filterByExpr(y)
-  y <- y[keep,,keep.lib.sizes=FALSE]
+      # サブセット後に両方のグループが存在するか確認
+      if (nlevels(analysis_group) < 2) {
+           stop("エラー: サブセット後に比較に必要な2つのグループが存在しません。各グループにサンプルがあるか確認してください。")
+      }
+      cat("サブセット後のサンプル数:", ncol(analysis_countdata), "\n")
+      print("サブセット後のグループ情報:")
+      print(table(analysis_group))
+  }
+  cat("解析に使用するグループ情報:\n"); print(table(analysis_group))
 
-  # 3. Normalization (TMM normalization)
-  y <- calcNormFactors(y)
 
-  # 4. Dispersion estimation
-  design <- model.matrix(~0+group) # Create model matrix for group comparison
-  colnames(design) <- levels(group) # Set column names
-  y <- estimateDisp(y, design)
-
-  # 5. BCV plot (check dispersion estimation)
-  plotBCV(y)
-
-  # 6. MDS plot (check sample relationships)
-  plotMDS(y, col=as.numeric(group)) # Color-code by condition
-  legend("topright", legend=levels(group), col=1:nlevels(group), pch=16) # Add legend
-
-  # List to store results
-  qlf_results <- list()
-
-  # 7. Differential gene expression analysis (GLM QLF test) - Run for each comparison
-  for (comparison in comparisons) {
-    target_group <- comparison[1]
-    reference_group <- comparison[2]
-    comparison_name <- paste0(target_group, "_vs_", reference_group)
-
-    con_target_vs_ref <- makeContrasts(contrasts = paste0(target_group, " - ", reference_group), levels=design)
-    fit_target_vs_ref <- glmQLFit(y, design)
-    qlf_target_vs_ref <- glmQLFTest(fit_target_vs_ref, contrast=con_target_vs_ref)
-
-    # 8. Summary of results and MD plot
-    print(paste("Summary for comparison:", comparison_name)) # Display comparison name
-    print(summary(decideTests(qlf_target_vs_ref)))
-    plotMD(qlf_target_vs_ref, main = comparison_name) # Add comparison name to MD plot title
-
-    # 9. Save results (RDS file)
-    date_prefix <- format(Sys.Date(), "%y%m%d")
-    filename <- paste0(output_dir, '/', date_prefix, '_qlf_', comparison_name, '.rds') # Include comparison name in filename
-    saveRDS(qlf_target_vs_ref, filename)
-    qlf_results[[comparison_name]] <- qlf_target_vs_ref # Store results in list (comparison name as key)
+  # --- 出力ディレクトリとファイル保存設定 ---
+  save_files <- !is.null(output_dir)
+  # ... (保存設定のコードはそのまま) ...
+  if (save_files) {
+    if (!dir.exists(output_dir)) { dir.create(output_dir, recursive = TRUE); cat("出力ディレクトリを作成しました:", output_dir, "\n") }
+     cat("結果ファイルは次のディレクトリに保存されます:", output_dir, "\n")
+  } else {
+    cat("ファイル保存はスキップされます。\n")
   }
 
-  return(qlf_results) # Return list of results for all comparisons
+
+  # --- edgeR 解析ステップ (analysis_countdata と analysis_group を使用) ---
+
+  # 1. DGEListオブジェクトの作成 (★analysis_***を使用)
+  y <- DGEList(counts = analysis_countdata, group = analysis_group)
+  cat("DGEListオブジェクトを作成しました。\n")
+
+  # 2. フィルタリング (★analysis_groupを使用)
+  keep <- filterByExpr(y, group = analysis_group) # デザイン行列を使う場合は design= を指定
+   if(sum(keep) == 0) { stop("エラー: フィルタリング後に遺伝子が残りませんでした。filterByExprの基準を確認してください。") }
+  y <- y[keep, , keep.lib.sizes = FALSE]
+  cat("低発現遺伝子をフィルタリングしました。残りの遺伝子数:", nrow(y), "\n")
+
+  # 3. 正規化 (TMM法)
+  y <- calcNormFactors(y)
+  cat("TMM正規化を実行しました。\n")
+
+  # 4. 分散推定 (★analysis_groupを使用)
+  design <- model.matrix(~ 0 + analysis_group)
+  colnames(design) <- levels(analysis_group) # designの列名は analysis_group のレベルに依存
+  print("デザイン行列:")
+  print(design)
+   y <- tryCatch({ estimateDisp(y, design) }, error = function(e) { stop(paste("分散推定中にエラー:", e$message)) })
+  cat("分散推定を実行しました。\n")
+
+  # 5. BCVプロット
+  print("BCVプロットを表示します...")
+  plotBCV(y)
+  title("Biological Coefficient of Variation (BCV) Plot")
+
+  # 6. MDSプロット
+  print("MDSプロットを表示します...")
+  # ... (MDSプロットのコードはそのまま or ggplot版) ...
+   mds_data <- plotMDS(y, plot=FALSE)
+   plot(mds_data$x, mds_data$y, col=as.numeric(y$samples$group), pch=16, main="MDS Plot", xlab="Dim 1", ylab="Dim 2", las=1)
+   text(mds_data$x, mds_data$y, labels=colnames(y), pos=3, cex=0.7)
+   legend("topright", legend=levels(y$samples$group), fill=1:nlevels(y$samples$group), border=NA, cex=0.8)
+
+
+  # 7. 差次発現解析 (GLM QL F-test) - design と比較ペアを使用
+  cat("\n--- 差次発現解析を開始:", comparison_name, "---\n")
+  fit_glm <- glmQLFit(y, design)
+
+  # コントラスト作成 (target/reference は元の comparison_pair の名前を使用)
+  # makeContrasts は design 行列の列名 (levels=design) を参照する
+  contrast_formula <- paste0(target_group, " - ", reference_group)
+  con_target_vs_ref <- makeContrasts(contrasts = contrast_formula, levels = design)
+  print("コントラスト行列:")
+  print(con_target_vs_ref)
+
+  # GLM QL F-test 実行
+  qlf_result_single <- glmQLFTest(fit_glm, contrast = con_target_vs_ref)
+
+  # 8. 結果要約とMDプロット
+  cat("結果の要約 (FDR < 0.05):\n")
+  print(summary(decideTests(qlf_result_single)))
+  print(paste("MDプロットを表示します (", comparison_name, ")..."))
+  plotMD(qlf_result_single, main = comparison_name)
+  abline(h = c(-1, 1), col = "blue", lty = 2)
+
+  # 9. 結果をRDSファイルとして保存 (Optional)
+  # ... (保存コードはそのまま) ...
+   if (save_files) {
+     date_prefix <- format(Sys.Date(), "%y%m%d")
+     filename <- file.path(output_dir, paste0(date_prefix, '_qlf_', comparison_name, '.rds'))
+     tryCatch({ saveRDS(qlf_result_single, file = filename); cat("結果をRDSとして保存しました:", filename, "\n") }, error = function(e) { warning("RDSファイルの保存中にエラー:", e$message) })
+   }
+
+
+  cat("\n--- 解析完了:", comparison_name, "---\n")
+
+  # 単一の比較結果 (qlfオブジェクト) を返す
+return(topTags(qlf_result_single, n = Inf)$table)
+#  return(qlf_result_single$table)
 }
 
-
-# Run the function
-results <- perform_edgeR_generalized(countdata, group, comparisons_list)
-
-# Completion message
-cat("edgeR analysis completed. Results saved in:", output_dir, "\n")
+cat("単一比較用解析関数 'perform_edgeR_one_comparison' を定義しました (サンプル選択オプション付き)。\n")
