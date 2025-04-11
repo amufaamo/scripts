@@ -1,464 +1,358 @@
 #!/usr/bin/env Rscript
-
 # ==============================================================================
-# R Script: perform_edgeR.R
+# R Script: process_featurecounts.R
 #
 # Description:
-#   edgeRパッケージを用いて、RNA-Seqカウントデータから差次発現遺伝子解析を
-#   行うための関数 `perform_edgeR` を定義します。
-#   この関数は、単一の比較ペア、または複数の比較ペアのリストを入力として受け付け、
-#   結果として `topTags` の結果テーブル (data.frame) またはそのリストを返します。
-#   バッチ効果の補正や、QC/正規化/分散推定ステップで使用するサンプルの選択が可能です。
-#   オプションで各種プロットやバッチ効果補正後のPCAプロットを生成・保存します。
-#   有意性の判定に使用するFDRとlogFCの閾値を引数で指定できます。
+#   featureCounts の出力ファイルをマージし、フィルタリング後、
+#   CPM および スケール化された logCPM (Z-score) を計算するスクリプト。
 #
 # Usage:
-#   source("perform_edgeR.R")
-#   # 単一比較の場合: c("Case", "Control") を渡す -> 結果テーブル(df)が返る
-#   result_table_single <- perform_edgeR(..., comparisons = c("Case", "Control"), ...)
-#   # 複数比較の場合: list(c("A", "B"), c("A", "C")) を渡す -> 結果テーブルのリストが返る
-#   results_table_list <- perform_edgeR(..., comparisons = list(A_vs_B=c("A","B"), A_vs_C=c("A","C")), ...)
+#   source("process_featurecounts.R")
+#   results <- process_featurecounts(
+#                 input_dir = "path/to/featurecounts/output",
+#                 file_pattern = "\\.txt$", # featureCountsファイルのパターン
+#                 sample_metadata_df = your_metadata_dataframe
+#              )
+#   cpm_data <- results$cpm
+#   scaled_logcpm_data <- results$scaled_logcpm
 #
-# Last Updated: 2025-04-08 (最終確認版)
-# Requirements: edgeR, limma, matrixStats
+# Requirements: edgeR, dplyr, matrixStats
+# Last Updated: 2025-04-09
 # ==============================================================================
 
 # --- 0. 必要なライブラリの読み込み ---
+# stopifnot はエラー時に停止させる堅牢な方法
 stopifnot(requireNamespace("edgeR", quietly = TRUE))
-stopifnot(requireNamespace("limma", quietly = TRUE))
-stopifnot(requireNamespace("matrixStats", quietly = TRUE))
+stopifnot(requireNamespace("dplyr", quietly = TRUE)) # データ操作に使用
+stopifnot(requireNamespace("matrixStats", quietly = TRUE)) # rowVarsに使用
+
 library(edgeR)
-library(limma)
+library(dplyr)
 library(matrixStats)
 
-cat("ライブラリ 'edgeR', 'limma', 'matrixStats' を読み込みました。\n")
+cat("ライブラリ 'edgeR', 'dplyr', 'matrixStats' を読み込みました。\n")
+
+# --- 1. featureCounts ファイルをマージする関数 ---
+# 提供された merge_featurecount_data 関数を基にする
+merge_featurecounts <- function(input_dir, pattern) {
+  # ディレクトリが存在するか確認
+  if (!dir.exists(input_dir)) {
+    stop("エラー: 指定された入力ディレクトリが存在しません: ", input_dir)
+  }
+
+  # ディレクトリ内のファイルリストを取得
+  all_files <- list.files(input_dir, pattern = pattern, full.names = TRUE, recursive = FALSE) # recursive = FALSE を明示
+
+  if (length(all_files) == 0) {
+     warning(paste("指定されたパターン '", pattern, "' に一致するファイルが",
+                   input_dir, "に見つかりませんでした。"))
+     return(NULL)
+  }
+
+  # ファイルリストから "ensembl" を含むものを除外
+  files_to_process <- all_files[!grepl("ensembl", basename(all_files), perl = TRUE)]
+
+  if (length(files_to_process) == 0) {
+    warning(paste("パターン '", pattern, "' に一致し、かつファイル名に 'ensembl' を含まないファイルが",
+                  input_dir, "に見つかりませんでした。"))
+    return(NULL)
+  }
+
+  cat("処理対象のファイル (", length(files_to_process), "件):\n", sep="")
+  print(basename(files_to_process))
+
+  # 結果を格納するデータフレームを初期化
+  merged_df <- NULL
+
+  # フィルタリングされたファイルリストをループ処理
+  for (file_path in files_to_process) {
+    cat("  読み込み中:", basename(file_path), "...\n")
+    # エラーハンドリングを追加
+    df <- tryCatch({
+        read.table(file_path, header = TRUE, comment.char = "#", sep = "\t", check.names = FALSE, stringsAsFactors = FALSE)
+    }, error = function(e) {
+        warning(paste("ファイルの読み込みに失敗しました:", file_path, "-", e$message))
+        return(NULL) # エラー時はNULLを返す
+    })
+
+    if (is.null(df)) next # 読み込み失敗時はスキップ
+
+    # "Geneid" カラムの存在確認
+    if (!"Geneid" %in% colnames(df)) {
+      warning(paste("警告: Geneid列が見つかりません。スキップします:", basename(file_path)))
+      next
+    }
+
+    # カウント列を特定 (featureCounts の標準出力は通常7列目だが、より堅牢にする)
+    # 最後の列をカウントデータと仮定する (より安全な方法は列名で指定すること)
+    # ここでは提供されたスクリプトに合わせて7列目を仮定するが、注意が必要
+    count_col_index <- 7
+    if (ncol(df) < count_col_index) {
+       warning(paste("警告: 列数が", count_col_index, "未満です。スキップします:", basename(file_path)))
+       next
+    }
+    count_col_name <- colnames(df)[count_col_index]
+    cat("    カウント列として使用:", count_col_name, "\n")
+
+    # サンプル名をファイル名から取得 (より堅牢な方法を推奨)
+    # ここでは拡張子を除去するだけ
+    sample_name <- gsub(pattern, "", basename(file_path))
+    # 必要に応じて接頭辞なども除去: sample_name <- gsub("^prefix_", "", sample_name)
+    cat("    サンプル名として使用:", sample_name, "\n")
 
 
-# --- 3. edgeR解析を実行する関数 (最終版) ---
+    # 必要な列（Geneidとカウントデータ）を抽出
+    # check.names=FALSE を read.table で指定したので、特殊文字が含まれていても大丈夫なはず
+    count_data <- df[, c("Geneid", count_col_name), drop = FALSE]
+    # カウント列が数値でない場合は警告し、数値に変換を試みる
+    if (!is.numeric(count_data[[2]])) {
+        warning(paste("警告:", basename(file_path), "のカウント列", count_col_name, "が数値ではありません。数値への変換を試みます。"))
+        count_data[[2]] <- suppressWarnings(as.numeric(count_data[[2]]))
+    }
+    colnames(count_data) <- c("Geneid", sample_name) # カラム名を変更
 
-perform_edgeR <- function(
-    countdata,
-    group,
-    comparisons, # 単一ペアのベクトル または ペアのリスト
-    batch_info = NULL,
-    output_dir = NULL,
-    use_all_samples_for_qc_norm_disp = TRUE,
-    fdr_threshold = 0.05, # FDR閾値
-    logfc_threshold = 0    # logFC閾値 (絶対値)
+    # 結合
+    if (is.null(merged_df)) {
+      merged_df <- count_data
+    } else {
+      merged_df <- merge(merged_df, count_data, by = "Geneid", all = TRUE) # all=TRUE で outer join
+    }
+  } # ループ終了
+
+  # マージ後に発生したNAを0で置換（Outer join で片方にしか存在しない遺伝子のため）
+  if (!is.null(merged_df)) {
+      # Geneid列以外を対象にNAを0に置換
+      numeric_cols <- setdiff(colnames(merged_df), "Geneid")
+      for(col in numeric_cols) {
+          merged_df[[col]][is.na(merged_df[[col]])] <- 0
+      }
+      cat("データのマージが完了しました。最終的な次元:", paste(dim(merged_df), collapse=" x "), "\n")
+  } else {
+      cat("有効なデータがマージされませんでした。\n")
+  }
+
+  return(merged_df)
+}
+
+
+# --- 2. CPM と Scaled logCPM を計算するメイン関数 ---
+process_featurecounts <- function(
+    input_dir,                    # featureCounts出力ファイルがあるディレクトリ
+    file_pattern,                 # featureCounts出力ファイルのパターン (例: "\\.txt$")
+    sample_metadata_df,           # サンプルメタデータ (必須: サンプル名列, group列)
+    sample_name_col = "SampleName", # メタデータ内のサンプル名列名
+    group_col = "group",            # メタデータ内のグループ列名
+    prior_count_logcpm = 2        # logCPM計算時のprior count
     ) {
 
-  # --- 入力データの検証 ---
-  cat("--- 入力データの検証を開始 ---\n")
-  if (!is.data.frame(countdata) && !is.matrix(countdata)) { stop("エラー: countdata は data.frame または matrix である必要があります。") }
-  if (!is.vector(group) && !is.factor(group)) { stop("エラー: group は vector または factor である必要があります。") }
-  if (ncol(countdata) != length(group)) { stop("エラー: カウントデータの列数とグループ情報のサンプル数が一致しません。") }
-  original_group_factor <- factor(group)
-  if (!is.numeric(fdr_threshold) || fdr_threshold < 0 || fdr_threshold > 1) { stop("エラー: fdr_threshold は 0 から 1 の数値である必要があります。") }
-  if (!is.numeric(logfc_threshold) || logfc_threshold < 0) { stop("エラー: logfc_threshold は 0 以上の数値である必要があります。") }
-  cat(paste0("使用するFDR閾値: ", fdr_threshold, "\n"))
-  cat(paste0("使用するlogFC閾値 (絶対値): ", logfc_threshold, "\n"))
+  cat("\n--- データ処理プロセス開始 ---\n")
 
-  # comparisons 引数のチェックと処理
-  is_list_input <- FALSE; internal_comparison_list <- list()
-  if (is.list(comparisons) && !is.data.frame(comparisons)) { if(length(comparisons) == 0) stop("エラー: comparisons リストが空です。"); is_list_input <- TRUE; internal_comparison_list <- comparisons; cat("複数の比較ペアがリストとして指定されました。\n") }
-  else if (is.character(comparisons) && length(comparisons) == 2) { is_list_input <- FALSE; internal_comparison_list <- list(comparisons); cat("単一の比較ペアがベクトルとして指定されました。\n") }
-  else { stop("エラー: 'comparisons' 引数は、c('target', 'reference')形式のベクトル、またはそのリストである必要があります。") }
+  # --- 2a. データのマージ ---
+  cat("Step 1: featureCounts ファイルのマージを開始します...\n")
+  merged_counts_df <- merge_featurecounts(input_dir = input_dir, pattern = file_pattern)
 
-  valid_pairs_exist <- FALSE; processed_list <- list(); list_names <- names(internal_comparison_list); valid_names <- c()
-  for(i in 1:length(internal_comparison_list)) {
-      pair <- internal_comparison_list[[i]]
-      # リスト要素に名前があればそれを使う、なければペアから生成
-      pair_name_raw <- if(!is.null(list_names) && nzchar(list_names[i])) list_names[i] else paste(pair[1], pair[2], sep="_vs_")
-
-      if(is.character(pair) && length(pair) == 2 && pair[1] != pair[2] && all(pair %in% levels(original_group_factor))) {
-          valid_pairs_exist <- TRUE
-          processed_list[[length(processed_list) + 1]] <- pair # 有効なペアのみ追加
-          valid_names <- c(valid_names, pair_name_raw) # 対応する名前を保持
-          if(is_list_input) cat("  - OK:", paste(pair, collapse=" vs "), "( Name:", pair_name_raw, ")\n")
-      } else {
-          warning("リスト内の無効なペア:", paste(pair, collapse=" / "), " - スキップされます。グループ名がgroup引数に存在するか、ペアが同一でないか確認してください。")
-      }
-  }
-   internal_comparison_list <- processed_list # 有効なペアのみのリストで上書き
-   names(internal_comparison_list) <- valid_names # リストに名前を再設定
-
-   if (length(internal_comparison_list) == 0) {
-       stop("エラー: 有効な比較ペアが指定されませんでした。")
-   }
-
-  # バッチ情報の検証
-  analysis_batch <- NULL; original_batch_factor <- NULL
-  if (!is.null(batch_info)) {
-      if (length(batch_info) != ncol(countdata)) { stop("エラー: バッチ情報の長さがカウントデータの列数と一致しません。") }
-      original_batch_factor <- factor(batch_info)
-      cat("バッチ情報が提供されました。\n")
-  } else {
-      cat("バッチ情報は提供されていません。\n")
+  if (is.null(merged_counts_df) || nrow(merged_counts_df) == 0 || ncol(merged_counts_df) <= 1) {
+    stop("エラー: featureCounts ファイルのマージに失敗したか、有効なデータが含まれていません。")
   }
 
-  # グループとバッチのクロス集計を表示
-  if (!is.null(original_batch_factor)) {
-      cat("\n--- グループとバッチのクロス集計 ---\n")
-      if(length(original_group_factor) == length(original_batch_factor)) {
-           cross_tab <- table(Group = original_group_factor, Batch = original_batch_factor)
-           print(cross_tab)
-           if(any(cross_tab == 0)){
-                warning("警告: グループとバッチの組み合わせにサンプル数が0のセルがあります。交絡の可能性があります。")
-           }
-      } else {
-          warning("警告: クロス集計スキップ。グループとバッチの長さが一致しません。")
-      }
-      cat("---------------------------------\n\n")
+  # --- 2b. メタデータとカウントデータの整合性チェックと準備 ---
+  cat("Step 2: メタデータとカウントデータの整合性を確認し、準備します...\n")
+
+  # メタデータに必要な列が存在するか確認
+  required_meta_cols <- c(sample_name_col, group_col)
+  if (!all(required_meta_cols %in% colnames(sample_metadata_df))) {
+    stop("エラー: メタデータに必須の列 (", paste(required_meta_cols, collapse=", "), ") が存在しません。")
   }
 
-  # --- 使用するサンプルを決定 ---
-  if (use_all_samples_for_qc_norm_disp) {
-      cat("初期ステップで「全サンプル」を使用します。\n")
-      analysis_countdata <- countdata
-      analysis_group <- original_group_factor
-      if (!is.null(original_batch_factor)) { analysis_batch <- original_batch_factor }
-  } else {
-      cat("初期ステップで「比較ペアのサンプルのみ」を使用します (注意: 複数比較リストの場合、最初の有効なペアに基づきます)。\n")
-      # 最初の有効なペアを取得
-      current_pair_for_subset <- internal_comparison_list[[1]]
-      samples_to_keep_logical <- original_group_factor %in% current_pair_for_subset
-      if (sum(samples_to_keep_logical) < 2) { stop("エラー: 比較ペアに属するサンプル数が2未満のため、ペアのみでの解析は実行できません。") }
-      analysis_countdata <- countdata[, samples_to_keep_logical, drop = FALSE]
-      analysis_group <- droplevels(original_group_factor[samples_to_keep_logical])
-      if (nlevels(analysis_group) < 2) { stop("エラー: サブセット後に比較に必要な2つのグループが存在しません。") }
-      if (!is.null(original_batch_factor)) {
-          analysis_batch <- droplevels(original_batch_factor[samples_to_keep_logical])
-          if(nlevels(analysis_batch) <= 1) { analysis_batch <- NULL } # 1レベル以下ならモデルに含めない
-      }
-      cat("サブセット後のサンプル数:", ncol(analysis_countdata), "\n")
-      cat("サブセット後のグループ情報:\n"); print(table(analysis_group))
-      if (!is.null(analysis_batch)) { cat("サブセット後のバッチ情報:\n"); print(table(analysis_batch)) } else { cat("サブセット後のバッチ情報: なし\n")}
-  }
-  cat("解析に使用するグループ情報:\n"); print(table(analysis_group))
-  if (!is.null(analysis_batch)) { cat("解析に使用するバッチ情報:\n"); print(table(analysis_batch)) }
+  # マージされたカウントデータのサンプル名を取得 (Geneid列を除く)
+  count_sample_names <- colnames(merged_counts_df)[-1]
 
-  # --- 出力ディレクトリとファイル保存設定 ---
-  save_files <- !is.null(output_dir)
-  if (save_files) {
-    if (!dir.exists(output_dir)) { dir.create(output_dir, recursive = TRUE); cat("出力ディレクトリを作成しました:", output_dir, "\n") }
-     cat("結果ファイルは次のディレクトリに保存されます:", output_dir, "\n")
-  } else {
-    cat("ファイル保存はスキップされます。\n")
+  # メタデータからカウントデータに存在するサンプルを抽出
+  metadata_subset <- sample_metadata_df[sample_metadata_df[[sample_name_col]] %in% count_sample_names, ]
+
+  if (nrow(metadata_subset) == 0) {
+      stop("エラー: メタデータに、マージされたカウントデータのサンプル名が見つかりません。")
+  }
+  if (nrow(metadata_subset) != length(count_sample_names)) {
+      warning("警告: メタデータ内のサンプル数とカウントデータのサンプル数が一致しません。カウントデータに存在するサンプルのみを使用します。")
+      # カウントデータ側もメタデータに存在するサンプルに絞る
+      samples_to_keep <- metadata_subset[[sample_name_col]]
+      merged_counts_df <- merged_counts_df[, c("Geneid", samples_to_keep), drop = FALSE]
+      count_sample_names <- samples_to_keep # 更新
   }
 
+  # カウントデータの列順序に合わせてメタデータを並び替え
+  metadata_ordered <- metadata_subset[match(count_sample_names, metadata_subset[[sample_name_col]]), ]
 
-  # --- edgeR 解析ステップ (共通部分) ---
-  cat("\n--- edgeR 解析ステップ開始 (共通部分) ---\n")
-  # 1. DGEList
-  y <- DGEList(counts = analysis_countdata, group = analysis_group)
-  if (!is.null(analysis_batch)) { y$samples$batch <- analysis_batch }
-  cat("1. DGEListオブジェクト作成完了。\n")
+  # グループ情報をファクターとして取得
+  analysis_group <- factor(metadata_ordered[[group_col]])
+  cat("使用するグループ情報:\n")
+  print(table(analysis_group))
 
-  # 2. Design Matrix
-  group_term_name <- "analysis_group"; batch_term_name <- "analysis_batch"
-  if (!is.null(analysis_batch)) {
-       design_formula <- as.formula(paste("~ 0 +", group_term_name, "+", batch_term_name))
-       # model.matrixに渡すデータフレームを明示的に作成
-       model_data <- data.frame(analysis_group=analysis_group)
-       model_data[[batch_term_name]] <- analysis_batch # 列名を変数で指定
-       design <- model.matrix(design_formula, data=model_data)
-       cat("2. デザイン行列を 'group + batch' で作成。\n")
-  } else {
-       design_formula <- as.formula(paste("~ 0 +", group_term_name))
-       model_data <- data.frame(analysis_group=analysis_group)
-       design <- model.matrix(design_formula, data=model_data)
-       # インターセプトなし、グループのみの場合、列名は自動でレベル名になることが多いが、念のため
-       colnames(design) <- levels(analysis_group)
-       cat("2. デザイン行列を 'group' のみで作成。\n")
-  }
-  # Rで有効な列名に変換
-  colnames(design) <- make.names(colnames(design))
-  print("デザイン行列:")
-  print(design)
+  # カウントデータを数値行列に変換 (Geneidをrownamesに設定)
+  count_matrix <- as.matrix(merged_counts_df[, -1, drop = FALSE])
+  rownames(count_matrix) <- merged_counts_df$Geneid
+  storage.mode(count_matrix) <- "numeric" # Ensure numeric storage
 
-  # Rank check
-  design_rank <- qr(design)$rank; num_columns <- ncol(design)
-  if (design_rank < num_columns) { warning(paste("警告: デザイン行列がフルランクではありません (ランク =", design_rank, ", 列数 =", num_columns, "). 交絡の可能性があります。")) }
-  else { cat("   デザイン行列はフルランクです。\n") }
+  # --- 2c. edgeR オブジェクト作成とフィルタリング ---
+  cat("Step 3: DGEListオブジェクトを作成し、低発現遺伝子をフィルタリングします...\n")
+  y <- DGEList(counts = count_matrix, group = analysis_group)
 
-  # 3. Filtering
-  cat("3. フィルタリング中...\n")
+  # フィルタリングのためのデザイン行列を作成 (グループ情報のみを使用)
+  design <- model.matrix(~ analysis_group)
+  cat("フィルタリングに使用するデザイン行列 (最初の数行):\n")
+  print(head(design))
+
+  # filterByExpr を使用してフィルタリング対象を決定
   keep <- filterByExpr(y, design = design)
-  if(sum(keep) == 0) { stop("エラー: フィルタリング後に遺伝子が残りませんでした。") }
-  y <- y[keep, , keep.lib.sizes = FALSE]
-  cat("   完了。残りの遺伝子数:", nrow(y), "\n")
+  y_filtered <- y[keep, , keep.lib.sizes = FALSE]
 
-  # 4. Normalization
-  cat("4. TMM正規化中...\n"); y <- calcNormFactors(y); cat("   完了。\n")
+  n_genes_before <- nrow(y)
+  n_genes_after <- nrow(y_filtered)
+  cat("フィルタリング完了。\n")
+  cat("  フィルタリング前の遺伝子数:", n_genes_before, "\n")
+  cat("  フィルタリング後の遺伝子数:", n_genes_after, "\n")
 
-  # 5. Dispersion Estimation
-  cat("5. 分散推定中...\n"); y <- tryCatch({ estimateDisp(y, design) }, error = function(e) { stop(paste("分散推定中にエラー:", e$message)) }); cat("   完了。\n")
-
-  # 6. BCV Plot
-  cat("6. BCVプロット生成中...\n")
-  bcv_filename_base <- "Overall_BCV_Plot"
-  tryCatch({
-      plotBCV(y); title("BCV Plot")
-      if (save_files) {
-          pdf_filename_bcv <- file.path(output_dir, paste0(bcv_filename_base, ".pdf"))
-          pdf(pdf_filename_bcv); plotBCV(y); title("BCV Plot"); dev.off()
-          cat("   BCVプロットを保存しました:", pdf_filename_bcv, "\n")
-      }
-  }, error=function(e){ warning("BCVプロットの生成/保存中にエラー:", e$message)})
-
-  # 7. MDS Plot
-  cat("7. MDSプロット生成中...\n")
-  mds_filename_base <- "Overall_MDS_Plot"
-  tryCatch({
-      mds_data <- plotMDS(y, plot=FALSE)
-      # Plot colored by group
-      plot(mds_data$x, mds_data$y, col=as.numeric(y$samples$group), pch=16, main="MDS Plot (Color=Group)", xlab="Dim 1", ylab="Dim 2", las=1)
-      text(mds_data$x, mds_data$y, labels=colnames(y), pos=3, cex=0.7)
-      legend("topright", legend=levels(y$samples$group), fill=1:nlevels(y$samples$group), border=NA, cex=0.8, title="Group")
-      if (save_files) {
-          pdf_filename_mds_group <- file.path(output_dir, paste0(mds_filename_base, "_GroupColor.pdf"))
-          pdf(pdf_filename_mds_group); plot(mds_data$x, mds_data$y, col=as.numeric(y$samples$group), pch=16, main="MDS Plot (Color=Group)", xlab="Dim 1", ylab="Dim 2", las=1); text(mds_data$x, mds_data$y, labels=colnames(y), pos=3, cex=0.7); legend("topright", legend=levels(y$samples$group), fill=1:nlevels(y$samples$group), border=NA, cex=0.8, title="Group"); dev.off()
-          cat("   MDSプロット(Group Color)を保存しました:", pdf_filename_mds_group, "\n")
-      }
-       # Plot colored/shaped by batch (if available)
-       if (!is.null(y$samples$batch)) {
-          batch_levels <- levels(y$samples$batch)
-          batch_pch <- (15:(15 + length(batch_levels) - 1)) %% 26 # Use different point shapes
-          plot(mds_data$x, mds_data$y, col=as.numeric(y$samples$group), pch=batch_pch[as.numeric(y$samples$batch)], main="MDS Plot (Color=Group, Shape=Batch)", xlab="Dim 1", ylab="Dim 2", las=1)
-          text(mds_data$x, mds_data$y, labels=colnames(y), pos=3, cex=0.7)
-          legend("topright", legend=levels(y$samples$group), fill=1:nlevels(y$samples$group), border=NA, cex=0.8, title="Group")
-          legend("bottomright", legend=batch_levels, pch=batch_pch, border=NA, cex=0.8, title="Batch")
-          if (save_files) {
-              pdf_filename_mds_batch <- file.path(output_dir, paste0(mds_filename_base, "_BatchShape.pdf"))
-              pdf(pdf_filename_mds_batch); plot(mds_data$x, mds_data$y, col=as.numeric(y$samples$group), pch=batch_pch[as.numeric(y$samples$batch)], main="MDS Plot (Color=Group, Shape=Batch)", xlab="Dim 1", ylab="Dim 2", las=1); text(mds_data$x, mds_data$y, labels=colnames(y), pos=3, cex=0.7); legend("topright", legend=levels(y$samples$group), fill=1:nlevels(y$samples$group), border=NA, cex=0.8, title="Group"); legend("bottomright", legend=batch_levels, pch=batch_pch, border=NA, cex=0.8, title="Batch"); dev.off()
-              cat("   MDSプロット(Batch Shape)を保存しました:", pdf_filename_mds_batch, "\n")
-          }
-       }
-  }, error=function(e){ warning("MDSプロットの生成/保存中にエラー:", e$message)})
-
-  # 8. GLM Fit
-  cat("8. GLMモデルフィッティング中...\n"); fit_glm <- glmQLFit(y, design); cat("   GLMフィット完了。\n")
-
-  # --- 比較ごとの処理 (ループ) ---
-  results_output_tables <- list()
-  cat("\n--- 各比較の差次発現解析を開始 ---\n")
-
-  comp_names_in_list <- names(internal_comparison_list)
-  if(is.null(comp_names_in_list)) comp_names_in_list <- 1:length(internal_comparison_list) # Use index if no names
-
-  for (i in 1:length(internal_comparison_list)) {
-      current_pair <- internal_comparison_list[[i]]
-      list_element_name <- comp_names_in_list[i]
-      # Use provided list name if valid, otherwise generate one
-      if(is.na(list_element_name) || is.null(list_element_name) || !nzchar(list_element_name)){
-           comparison_name_key <- paste0(current_pair[1], "_vs_", current_pair[2])
-      } else {
-           comparison_name_key <- list_element_name
-      }
-      target_group <- current_pair[1]; reference_group <- current_pair[2]
-      safe_comparison_name <- gsub("[^a-zA-Z0-9_.-]", "_", comparison_name_key) # Sanitize name for filenames
-      cat("\n解析中:", comparison_name_key, "(", i, "/", length(internal_comparison_list), ")\n")
-
-      # 8a. コントラスト作成
-      target_design_colname <- make.names(paste0(group_term_name, target_group))
-      reference_design_colname <- make.names(paste0(group_term_name, reference_group))
-      if (!target_design_colname %in% colnames(design) || !reference_design_colname %in% colnames(design)) {
-          warning(paste0("スキップ: コントラスト作成失敗 (", comparison_name_key, ")\n   デザイン行列に `", target_design_colname, "` または `", reference_design_colname, "` が見つかりません。\n   列名: ", paste(colnames(design), collapse = ", ")))
-          results_output_tables[[comparison_name_key]] <- NULL # Store NULL for this failed comparison
-          next # Skip to the next comparison
-      }
-      contrast_formula <- paste0(target_design_colname, " - ", reference_design_colname)
-      con_target_vs_ref <- makeContrasts(contrasts = contrast_formula, levels = design)
-      cat("   コントラスト:\n"); print(con_target_vs_ref)
-
-      # 8b. GLM QL F-test 実行
-      qlf_result_single <- NULL # Initialize
-      tryCatch({
-          qlf_result_single <- glmQLFTest(fit_glm, contrast = con_target_vs_ref)
-          cat("   GLM QLF Test 完了。\n")
-      }, error = function(e){
-          warning(paste0("GLM QLF Test中にエラー (", comparison_name_key, "): ", e$message))
-          results_output_tables[[comparison_name_key]] <- NULL # Store NULL if test fails
-          # Use return() within tryCatch's error handler is tricky for loop control,
-          # instead we'll check qlf_result_single is NULL later before topTags
-      })
-      # QLF Testでエラーが発生したら、この比較の残りをスキップ
-      if(is.null(qlf_result_single)) next
-
-      # 9. 結果要約とMDプロット
-      cat("   結果要約とMDプロット生成中...\n")
-      dt_summary <- decideTests(qlf_result_single, p.value = fdr_threshold, lfc = logfc_threshold, adjust.method = "BH")
-      cat("     結果要約 (FDR < ", fdr_threshold, ", |logFC| > ", logfc_threshold, "):\n", sep="")
-      print(summary(dt_summary))
-      cat("     MDプロット生成中 (有意な遺伝子を強調表示)...\n")
-      tryCatch({
-          plotMD(qlf_result_single, status = dt_summary, main = comparison_name_key, hl.col=c("blue","red"))
-          if (logfc_threshold > 0) { abline(h = c(-logfc_threshold, logfc_threshold), col = "grey", lty = 2) }
-          if (save_files) {
-              pdf_filename_md <- file.path(output_dir, paste0(safe_comparison_name, "_MD_Plot_Highlighted.pdf"))
-              pdf(pdf_filename_md); plotMD(qlf_result_single, status = dt_summary, main = comparison_name_key, hl.col=c("red","blue")); if (logfc_threshold > 0) { abline(h = c(-logfc_threshold, logfc_threshold), col = "grey", lty = 2) }; dev.off()
-              cat("     MDプロット (強調表示版) を保存しました:", pdf_filename_md, "\n")
-          }
-      }, error=function(e){ warning(paste0("MDプロット(", comparison_name_key, ")の生成/保存中にエラー:", e$message))})
-
-      # 11b. 結果を TopTags テーブルとして取得・格納
-      cat("   TopTagsテーブル生成中 (全遺伝子)...\n")
-      current_result_table <- NULL
-      tryCatch({
-          tt <- topTags(qlf_result_single, n = Inf, sort.by = "PValue", adjust.method = "BH")
-          current_result_table <- tt$table
-          results_output_tables[[comparison_name_key]] <- current_result_table
-          cat("     - TopTagsテーブル生成完了:", comparison_name_key, "\n")
-      }, error = function(e){
-          warning(paste0("TopTagsテーブルの生成中にエラー (", comparison_name_key, "): ", e$message))
-          results_output_tables[[comparison_name_key]] <- NULL # Store NULL if topTags fails
-      })
-
-      # 11c. 結果をRDSファイルとして保存 (qlfオブジェクト) (Optional)
-      if (save_files) {
-        date_prefix <- format(Sys.Date(), "%y%m%d")
-        rds_filename <- file.path(output_dir, paste0(date_prefix, '_qlf_', safe_comparison_name, '.rds'))
-         tryCatch({ saveRDS(qlf_result_single, file = rds_filename); cat("   QLFオブジェクトをRDSとして保存しました:", rds_filename, "\n") }, error = function(e) { warning(paste0("RDSファイル(", comparison_name_key, ")の保存中にエラー:", e$message)) })
-      }
-
-  } # ループ終了
-  cat("\n--- 全ての指定された比較の解析が完了 ---\n")
-
-
-  # 10. バッチ補正後のPCA (共通部分の後)
-  pca_results <- NULL
-  if (!is.null(y$samples$batch)) {
-      cat("10. バッチ補正後のPCAプロット生成中...\n")
-      pca_filename_base <- "Overall_PCA_Plot_BatchCorrected"
-      tryCatch({
-          logcpm <- cpm(y, log=TRUE, prior.count=3)
-          cat("   limma::removeBatchEffect を実行中...\n")
-          # removeBatchEffect に渡す design 行列から、バッチ項に関連する列を除外する必要があるか確認
-          # -> design 引数はバッチ効果推定に使うため、フルデザインで良い。
-          #    covariates 引数で調整したい他の因子（例: group）を指定することも可能。
-          #    ここではシンプルに batch と design を渡す。
-          corrected_logcpm <- removeBatchEffect(logcpm, batch=y$samples$batch, design=design)
-          cat("   PCAを計算中 (上位遺伝子選択)...\n")
-          rv <- matrixStats::rowVars(corrected_logcpm)
-          # Ensure rv doesn't contain NA/NaN which crashes order()
-          valid_rv <- !is.na(rv) & is.finite(rv)
-          rv_filtered <- rv[valid_rv]
-          if(length(rv_filtered) < 2) {
-              warning("PCA用の有効な分散を持つ遺伝子が2未満のため、PCAをスキップします。")
-          } else {
-               select <- order(rv_filtered, decreasing=TRUE)[seq_len(min(500, length(rv_filtered)))]
-               # select はフィルタリング後のインデックスなので、元のデータにマップし直す
-               original_indices <- which(valid_rv)[select]
-               pca_results <- prcomp(t(corrected_logcpm[original_indices,]), scale. = TRUE)
-               pca_data <- pca_results$x; percent_var <- round(100 * pca_results$sdev^2 / sum(pca_results$sdev^2), 1)
-               batch_levels <- levels(y$samples$batch); batch_pch <- (15:(15 + length(batch_levels) - 1)) %% 26
-               plot(pca_data[,1], pca_data[,2], col = as.numeric(y$samples$group), pch = batch_pch[as.numeric(y$samples$batch)], main = "PCA Plot (Batch Corrected logCPM, Top Var Genes)", xlab = paste0("PC1: ", percent_var[1], "% variance"), ylab = paste0("PC2: ", percent_var[2], "% variance"), las = 1)
-               legend("topright", legend=levels(y$samples$group), fill=1:nlevels(y$samples$group), title="Group", cex=0.8, border=NA)
-               legend("bottomright", legend=batch_levels, pch=batch_pch, title="Batch", cex=0.8, border=NA)
-               if (save_files) {
-                   pdf_filename_pca <- file.path(output_dir, paste0(pca_filename_base, ".pdf"))
-                   pdf(pdf_filename_pca); plot(pca_data[,1], pca_data[,2], col = as.numeric(y$samples$group), pch = batch_pch[as.numeric(y$samples$batch)], main = "PCA Plot (Batch Corrected logCPM, Top Var Genes)", xlab = paste0("PC1: ", percent_var[1], "% variance"), ylab = paste0("PC2: ", percent_var[2], "% variance"), las = 1); legend("topright", legend=levels(y$samples$group), fill=1:nlevels(y$samples$group), title="Group", cex=0.8, border=NA); legend("bottomright", legend=batch_levels, pch=batch_pch, title="Batch", cex=0.8, border=NA); dev.off()
-                   cat("   バッチ補正PCAプロットを保存しました:", pdf_filename_pca, "\n")
-               }
-          }
-      }, error=function(e){ warning(paste0("バッチ補正PCAの生成/保存中にエラー:", e$message))})
-  } else {
-      cat("10. バッチ情報がないため、バッチ補正PCAプロットはスキップされました。\n")
+  if (n_genes_after == 0) {
+      stop("エラー: フィルタリング後に遺伝子が残りませんでした。フィルタリング条件を確認してください。")
   }
 
+  # --- 2d. 正規化係数の計算 ---
+  cat("Step 4: TMM正規化係数を計算します...\n")
+  y_filtered <- calcNormFactors(y_filtered)
+  cat("正規化係数の計算完了。\n")
 
-  # --- 返り値の決定 ---
-  cat("\n--- 解析プロセス終了 ---\n")
-  # Remove NULL elements from results list (comparisons that failed)
-  final_results_output_tables <- Filter(Negate(is.null), results_output_tables)
+  # --- 2e. CPMの計算 ---
+  cat("Step 5: CPM (Counts Per Million) を計算します...\n")
+  cpm_matrix <- edgeR::cpm(y_filtered, log = FALSE)
+  # データフレームに変換し、Geneid列を追加
+  cpm_df <- as.data.frame(round(cpm_matrix, 3)) %>%
+              tibble::rownames_to_column("Geneid")
+  cat("CPM計算完了。\n")
 
-  if (is_list_input) {
-      cat("入力がリストだったため、TopTagsテーブルのリストを返します (失敗した比較は除外)。\n")
-      if(length(final_results_output_tables) == 0) warning("全ての比較で結果テーブルの生成に失敗しました。")
-      return(final_results_output_tables)
-  } else {
-      if (length(final_results_output_tables) == 1) {
-          cat("入力が単一ペアだったため、TopTagsテーブルを直接返します。\n")
-          return(final_results_output_tables[[1]])
-      } else {
-          # This case should ideally not be reached if input validation & processing is correct
-          warning("単一ペア入力処理中に予期せぬエラーまたは失敗が発生しました。リストまたはNULLを返します。")
-          return(final_results_output_tables) # Return the list (might be empty)
-      }
+  # --- 2f. Scaled logCPM (Z-score) の計算 ---
+  cat("Step 6: スケール化された logCPM (Z-score) を計算します...\n")
+  logcpm_matrix <- edgeR::cpm(y_filtered, log = TRUE, prior.count = prior_count_logcpm)
+
+  # 遺伝子ごとの分散を計算 (ゼロ分散のチェック)
+  gene_vars <- matrixStats::rowVars(logcpm_matrix, na.rm = TRUE)
+  zero_var_genes <- sum(gene_vars < 1e-8, na.rm = TRUE) # 非常に小さい分散もゼロとみなす
+  if (zero_var_genes > 0) {
+    showNotification(paste("スケール化警告: 分散がほぼゼロの遺伝子が", zero_var_genes,
+                           "個あります。これらの遺伝子のZ-scoreは NaN になります。"),
+                     type="warning", duration=10)
   }
+
+  # scale関数で行ごとにZ-score化 (行列を転置して適用し、再度転置して元に戻す)
+  # na.rm=TRUE で欠損値があっても計算できるようにする (通常logCPMではないはずだが念のため)
+  scaled_logcpm_matrix <- t(scale(t(logcpm_matrix), center = TRUE, scale = TRUE))
+  scaled_logcpm_matrix[is.nan(scaled_logcpm_matrix)] <- 0 # NaNが発生した場合0に置換（ゼロ分散遺伝子など）
+
+  # データフレームに変換し、Geneid列を追加
+  scaled_logcpm_df <- as.data.frame(round(scaled_logcpm_matrix, 3)) %>%
+                        tibble::rownames_to_column("Geneid")
+  cat("Scaled logCPM計算完了。\n")
+
+  # --- 2g. 結果の返却 ---
+  cat("--- データ処理プロセス終了 ---\n")
+  results <- list(
+    cpm = cpm_df,
+    scaled_logcpm = scaled_logcpm_df,
+    n_genes_filtered = n_genes_after,
+    n_genes_initial = n_genes_before
+  )
+  return(results)
 }
 
 # --- スクリプト読み込み完了メッセージ ---
-cat("関数 'perform_edgeR' が定義されました。\n")
-cat("使用法: source(\"perform_edgeR.R\") してから関数を呼び出してください。\n")
+cat("関数 'merge_featurecounts' と 'process_featurecounts' が定義されました。\n")
+cat("使用法: source(\"process_featurecounts.R\") してから関数を呼び出してください。\n")
+cat("例:\n")
+cat("  # sample_meta <- data.frame(SampleName=paste0('Sample', 1:4), group=rep(c('A','B'), each=2))\n")
+cat("  # results <- process_featurecounts(input_dir='path/to/counts', file_pattern='\\.txt$', sample_metadata_df=sample_meta)\n")
+cat("  # cpm_table <- results$cpm\n")
+cat("  # scaled_logcpm_table <- results$scaled_logcpm\n")
+
 
 # --- (オプション) スクリプトとして直接実行された場合のサンプル実行 ---
-if (sys.nframe() == 0 && !interactive()) {
+# この部分は source() で読み込んだ場合は実行されません
+if (!interactive() && sys.nframe() == 0) {
   cat("\n--- スクリプト直接実行時のサンプル解析開始 ---\n")
-  # --- サンプルデータ作成 ---
+
+  # サンプルデータとディレクトリの準備
   set.seed(123)
-  sample_counts <- matrix(rnbinom(2000, mu=50, size=5), ncol=8)
-  rownames(sample_counts) <- paste0("Gene", 1:250)
-  colnames(sample_counts) <- paste0("Sample", 1:8)
-  sample_counts_df <- as.data.frame(sample_counts)
-  sample_groups <- rep(c("GroupA", "GroupB"), each = 4)
-  sample_batch <- factor(rep(c("BatchX", "BatchY"), times = 4))
-  sample_comp_single <- c("GroupB", "GroupA")
-  # Use named list for clarity in output
-  sample_comp_list <- list(B_vs_A=c("GroupB", "GroupA"), A_vs_B=c("GroupA", "GroupB"))
-  cat("サンプルデータ:\n")
-  print(table(Group=sample_groups, Batch=sample_batch))
+  temp_dir <- tempdir()
+  sample_output_dir <- file.path(temp_dir, "sample_featurecounts_output")
+  if (!dir.exists(sample_output_dir)) dir.create(sample_output_dir)
+  cat("サンプルデータ出力先:", sample_output_dir, "\n")
 
-  # --- サンプル実行 (単一ペア) ---
-  cat("\n--- サンプル実行 (単一ペア) ---\n")
-  sample_result_single_table <- NULL
-  tryCatch({
-       sample_result_single_table <- perform_edgeR(
-            countdata = sample_counts_df,
-            group = sample_groups,
-            comparisons = sample_comp_single,
-            batch_info = sample_batch,
-            fdr_threshold=0.05, # Use default FDR
-            logfc_threshold=1    # Use logFC > 1 for summary
-        )
-   }, error = function(e){
-       cat("\nサンプル解析(単一)中にエラー:\n", e$message, "\n")
-   })
-   cat("\n--- サンプル結果 (単一ペア, Top 3 テーブル) ---\n")
-   if (!is.null(sample_result_single_table) && is.data.frame(sample_result_single_table)) {
-       print(head(sample_result_single_table, 3))
-   } else {
-       cat("結果なし、またはデータフレームではありません。\n")
-   }
+  # サンプルメタデータ作成
+  sample_names <- paste0("Sample", 1:6)
+  sample_metadata <- data.frame(
+    SampleName = sample_names,
+    group = rep(c("Control", "Treatment"), each = 3),
+    batch = rep(c("B1", "B2", "B3"), times = 2),
+    stringsAsFactors = FALSE
+  )
+  cat("サンプルメタデータ:\n")
+  print(sample_metadata)
 
-  # --- サンプル実行 (複数ペアリスト) ---
-  cat("\n--- サンプル実行 (複数ペアリスト) ---\n")
-  sample_result_table_list <- NULL
+  # ダミーのfeatureCountsファイルを作成
+  gene_ids <- paste0("Gene", 1:500)
+  for (s_name in sample_names) {
+    # ランダムなカウントデータ生成 (一部ゼロや低カウントを含むように)
+    counts <- rnbinom(500, mu = sample(c(0, 5, 50, 150), 500, replace = TRUE, prob=c(0.1, 0.3, 0.4, 0.2)), size = 10)
+    # featureCountsのような形式のデータフレームを作成
+    dummy_fc_df <- data.frame(
+      Geneid = gene_ids,
+      Chr = "chr1", Start = 1, End = 1000, Strand = "+", Length = 1000,
+      CountCol = counts, # 7列目にカウントデータ
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    )
+    colnames(dummy_fc_df)[7] <- s_name # 7列目の名前をサンプル名に (注意: 実際のfeatureCounts出力に合わせる必要あり)
+    # ファイルに書き出し (タブ区切り、ヘッダー付き、コメント行付き)
+    file_path <- file.path(sample_output_dir, paste0(s_name, ".featureCounts.txt"))
+    cat("# Program: featureCounts vX.Y.Z\n", file = file_path)
+    cat("# Command: featureCounts ...\n", file = file_path, append = TRUE)
+    write.table(dummy_fc_df, file = file_path, sep = "\t", quote = FALSE, row.names = FALSE, append = TRUE)
+  }
+  # "ensembl"を含むダミーファイルも作成（除外されることを確認するため）
+   dummy_fc_df_ensembl <- data.frame( Geneid = gene_ids[1:10], CountCol = 1:10 ); colnames(dummy_fc_df_ensembl)[2] <- "Sample_ensembl"
+   write.table(dummy_fc_df_ensembl, file = file.path(sample_output_dir, "Sample_with_ensembl_name.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+
+
+  cat("\n--- サンプルデータで process_featurecounts を実行 ---\n")
+  sample_results <- NULL
   tryCatch({
-       sample_result_table_list <- perform_edgeR(
-           countdata = sample_counts_df,
-           group = sample_groups,
-           comparisons = sample_comp_list,
-           batch_info = sample_batch,
-           fdr_threshold=0.05,
-           logfc_threshold = 0 # Default logFC for summary
-        )
-   }, error = function(e){
-       cat("\nサンプル解析(複数)中にエラー:\n", e$message, "\n")
-   })
-   cat("\n--- サンプル結果 (複数ペアリスト) ---\n")
-   if (!is.null(sample_result_table_list) && is.list(sample_result_table_list) && length(sample_result_table_list)>0) {
-       cat("結果リストの名前:\n")
-       print(names(sample_result_table_list))
-       cat("\n最初の比較 (", names(sample_result_table_list)[1], ") の Top 3 テーブル:\n")
-       if(!is.null(sample_result_table_list[[1]]) && is.data.frame(sample_result_table_list[[1]])) {
-           print(head(sample_result_table_list[[1]], 3))
-       } else {
-            cat("最初の比較の結果テーブルがありません。\n")
-       }
-   } else {
-       cat("結果なし、またはリストではありません。\n")
-   }
+    sample_results <- process_featurecounts(
+      input_dir = sample_output_dir,
+      file_pattern = "\\.featureCounts\\.txt$", # 作成したファイルのパターン
+      sample_metadata_df = sample_metadata,
+      sample_name_col = "SampleName", # メタデータの列名
+      group_col = "group"             # メタデータの列名
+    )
+  }, error = function(e) {
+    cat("\nサンプル解析中にエラーが発生しました:\n", e$message, "\n")
+  })
+
+  # 結果の表示
+  if (!is.null(sample_results)) {
+    cat("\n--- サンプル結果の概要 ---\n")
+    cat("フィルタリング前後の遺伝子数:", sample_results$n_genes_initial, "->", sample_results$n_genes_filtered, "\n")
+
+    cat("\nCPM データフレーム (最初の数行):\n")
+    print(head(sample_results$cpm))
+
+    cat("\nScaled logCPM データフレーム (最初の数行):\n")
+    print(head(sample_results$scaled_logcpm))
+  } else {
+    cat("\nサンプル解析で結果が得られませんでした。\n")
+  }
+
+  # クリーンアップ（不要ならコメントアウト）
+  # unlink(sample_output_dir, recursive = TRUE)
+  # cat("\nサンプルディレクトリを削除しました:", sample_output_dir, "\n")
 
   cat("\n--- サンプル解析終了 ---\n")
 }
