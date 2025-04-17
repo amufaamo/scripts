@@ -1,12 +1,9 @@
-merge_featurecount_data <- function(input_dir, pattern) {
-  # ディレクトリ内のファイルリストを取得
-  file_list <- list.files(input_dir, pattern = pattern, full.names = TRUE)
-  
+merge_featurecount_data <- function(file_fullpath_list) {
   # 結果を格納するデータフレームを初期化
   merged_df <- NULL
   
   # ファイルリストをループ処理
-  for (file_path in file_list) {
+  for (file_path in file_fullpath_list) {
     # ファイルを読み込み (header, comment.char, sep は featurecount の出力形式に合わせて調整)
     df <- read.table(file_path, header = TRUE, comment.char = "#", sep = "\t")
     
