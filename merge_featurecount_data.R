@@ -1,3 +1,11 @@
+# 複数のfeatureCountsの出力ファイル（.txt）を読み込み、
+# Geneidをキーとしてカウントデータを一つのデータフレームにマージする関数
+#
+# Args:
+#   file_fullpath_list: featureCountsの出力ファイルのフルパスのリスト（キャラクターベクトル）
+#
+# Returns:
+#   Geneidと各サンプルのカウントデータを含むデータフレーム
 merge_featurecount_data <- function(file_fullpath_list) {
   # 結果を格納するデータフレームを初期化
   merged_df <- NULL
@@ -9,7 +17,7 @@ merge_featurecount_data <- function(file_fullpath_list) {
     
     # サンプル名をファイル名から取得
     sample_name <- gsub(".txt$", "", basename(file_path))  # 拡張子を削除
-    sample_name <- gsub("^241225_", "", sample_name)  # 接頭辞を削除
+    sample_name <- gsub("^241225_", "", sample_name)      # 接頭辞を削除
 
     # "Geneid" カラムの存在確認
     if (!"Geneid" %in% colnames(df)) {
@@ -34,8 +42,9 @@ merge_featurecount_data <- function(file_fullpath_list) {
 
   return(merged_df)
   
-  # # 結果をファイルに出力
+  # # 結果をファイルに出力する場合（必要に応じてコメントを外してください）
+  # output_file <- "merged_counts.txt"
   # write.table(merged_df, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
-  
+  # 
   # cat("結合されたデータフレームを", output_file, "に出力しました。\n")
 }
