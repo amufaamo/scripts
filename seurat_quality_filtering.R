@@ -23,11 +23,11 @@ library(patchwork)
 #' @return フィルタリング後のSeuratオブジェクト。
 #'
 seurat_quality_filtering <- function(seurat_obj, 
-                               min_features = 200, 
+                               min_features = -Inf, 
                                max_features = Inf, 
                                min_count = -Inf, # ★nCount_RNAの下限を追加！
                                max_count = Inf,  # ★nCount_RNAの上限を追加！
-                               max_percent_mt = 5,
+                               max_percent_mt = 100,
                                show_plots = TRUE) {
   
   # フィルタリング前の細胞数を記録します
