@@ -20,7 +20,7 @@ library(patchwork)
 #'
 #' @return フィルタリング後のSeuratオブジェクト。
 #'
-filterSeuratObject <- function(seurat_obj, 
+seurat_quality_filtering <- function(seurat_obj, 
                                min_features = 200, 
                                max_features = Inf, 
                                max_percent_mt = 5,
