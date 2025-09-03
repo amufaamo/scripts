@@ -19,7 +19,7 @@ library(patchwork)
 #'
 #' @return QC情報（ミトコンドリア遺伝子割合など）が追加されたSeuratオブジェクトを返します。
 #'
-createSeuratAndQC <- function(h5_file_path, 
+seurat_h5_qc <- function(h5_file_path, 
                               project_name, 
                               save_plots = FALSE, 
                               output_dir = ".") {
